@@ -58,6 +58,18 @@ public class Pawn extends Piece {
      * @param board The current board state.
      * @return True if the move follows pawn movement/capture rules, false otherwise.
      */
+    /**
+     * Checks if the pawn attacks a square based purely on geometry.
+     * Unlike isValidMove, this does not require the target square to be occupied,
+     * which is needed for attack detection on empty squares (e.g. castling through
+     * an attacked square, or king safety checks).
+     */
+    @Override
+    public boolean isValidAttack(int fromRow, int fromCol, int toRow, int toCol, Piece[][] board) {
+        int direction = color.equals(Color.WHITE) ? -1 : 1;
+        return Math.abs(toCol - fromCol) == 1 && toRow - fromRow == direction;
+    }
+
     @Override
     public boolean isValidMove(int fromRow, int fromCol, int toRow, int toCol, Piece[][] board) {
         int direction = color.equals(Color.WHITE) ? -1 : 1; // White moves -1 row, Black moves +1 row

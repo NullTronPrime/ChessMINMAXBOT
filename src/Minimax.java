@@ -1,9 +1,8 @@
 import java.awt.Color;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Random; // Import Random for Zobrist hashing
 
 public class Minimax {
@@ -27,10 +26,18 @@ public class Minimax {
         }
     }
 
-    // Transposition table to store evaluated positions (Map Zobrist Hash to Entry)
-    private static Map<Long, TranspositionEntry> transpositionTable = new HashMap<>();
+    // Transposition table to store evaluated positions (fixed-size array indexed by Zobrist hash)
+    private static final TranspositionEntry[] transpositionTable = new TranspositionEntry[1 << 20];
     // Zobrist hashing utility
     private static ZobristHashing zobrist = new ZobristHashing();
+
+    public static long nodesSearched = 0;
+    private static long searchDeadline = Long.MAX_VALUE;
+
+    private static final int[][] historyTable = new int[2][512];
+    private static final Move[][] killerMoves = new Move[128][2];
+
+    private static final class SearchAborted extends RuntimeException {}
 
     // --- Static Evaluation Constants and Piece-Square Tables ---
     // Base piece values
@@ -326,11 +333,13 @@ public class Minimax {
      * @return The score of the best move found from this position for the 'color' player.
      */
      public static int negamax(Piece[][] board, int depth, int alpha, int beta, int color, BoardStateInfo boardState, int initialMaxDepth) {
+        nodesSearched++;
+        if ((nodesSearched & 1023) == 0 && System.currentTimeMillis() > searchDeadline) throw new SearchAborted();
         int alphaOrig = alpha; // Store original alpha value
         long currentHash = boardState.zobristHash; // Use hash from state object
 
         // --- Transposition Table Lookup ---
-        TranspositionEntry entry = transpositionTable.get(currentHash);
+        TranspositionEntry entry = ttProbe(currentHash);
         // Check hash match and sufficient depth
         if (entry != null && entry.zobristHash == currentHash && entry.depth >= depth) {
             switch (entry.type) {
@@ -346,12 +355,28 @@ public class Minimax {
         // --- Base Case: Depth Limit or Terminal Node ---
         if (depth == 0) {
             // Evaluate quiescent state instead of direct evaluation at depth 0
-            return quiescenceSearch(board, alpha, beta, color, boardState);
+            return quiescenceSearch(board, alpha, beta, color, boardState, initialMaxDepth - depth);
         }
 
         // --- Recursive Search ---
         boolean isBlackTurn = (color == 1);
-        List<Move> moves = generateMoves(board, isBlackTurn, true); // Generate and order moves
+        int ply = initialMaxDepth - depth;
+
+        // --- Null Move Pruning ---
+        if (depth >= 3 && !isKingInCheck(board, isBlackTurn ? Color.BLACK : Color.WHITE)) {
+            BoardStateInfo nullState = new BoardStateInfo(boardState);
+            long nh = currentHash;
+            if (nullState.enPassantTargetFile != -1) nh ^= zobrist.getEnPassantHash(nullState.enPassantTargetFile);
+            nullState.enPassantTargetFile = -1;
+            nh ^= zobrist.getSideToMoveHash();
+            nullState.zobristHash = nh;
+            int nullScore = -negamax(board, depth - 3, -beta, -beta + 1, -color, nullState, initialMaxDepth);
+            if (nullScore >= beta) {
+                return beta;
+            }
+        }
+
+        List<Move> moves = generateMoves(board, isBlackTurn, depth > 1, boardState, ply);
         if (moves.isEmpty()) {
             // Checkmate or Stalemate
             if (isKingInCheck(board, isBlackTurn ? Color.BLACK : Color.WHITE)) {
@@ -363,16 +388,29 @@ public class Minimax {
             }
         }
 
+        // --- Order the TT best move to the front ---
+        if (entry != null && entry.bestMove != null) {
+            for (int i = 1; i < moves.size(); i++) {
+                if (moves.get(i).equals(entry.bestMove)) {
+                    Move m = moves.remove(i);
+                    moves.add(0, m);
+                    break;
+                }
+            }
+        }
+
         int bestValue = Integer.MIN_VALUE; // Score relative to current player
         Move bestMove = null;
 
         // --- Principal Variation Search Logic ---
         // 1. Search the first move (potentially the best move from TT or move ordering) with a full window.
         Move firstMove = moves.get(0);
-        Piece[][] firstNewBoard = copyBoard(board);
-        // Apply move and get the *next* board state (including updated hash, EP, castling)
-        BoardStateInfo firstNextState = applyMove(firstNewBoard, firstMove, boardState);
-        bestValue = -negamax(firstNewBoard, depth - 1, -beta, -alpha, -color, firstNextState, initialMaxDepth);
+        BoardStateInfo firstNextState = applyMove(board, firstMove, boardState);
+        try {
+            bestValue = -negamax(board, depth - 1, -beta, -alpha, -color, firstNextState, initialMaxDepth);
+        } finally {
+            undoMove(board, firstMove);
+        }
         bestMove = firstMove;
         alpha = Math.max(alpha, bestValue);
 
@@ -381,24 +419,43 @@ public class Minimax {
             if (alpha >= beta) break; // Alpha-beta cutoff
 
             Move move = moves.get(i);
-            Piece[][] newBoard = copyBoard(board);
-            BoardStateInfo nextState = applyMove(newBoard, move, boardState);
+            BoardStateInfo nextState = applyMove(board, move, boardState);
 
-            // Zero Window Search: Assume the move is worse than the current best (alpha)
-            int score = -negamax(newBoard, depth - 1, -alpha - 1, -alpha, -color, nextState, initialMaxDepth);
+            try {
+                // Late Move Reduction: reduce quiet late moves, re-search if they beat alpha
+                int reduction = (i >= 4 && depth >= 3 && move.capturedPiece == null && !move.wasPromotion && !move.wasCastling) ? 1 : 0;
 
-            // If the zero window search failed high (score > alpha) and within beta,
-            // it means this move might be better than the current PV. Re-search with full window.
-            if (score > alpha && score < beta) {
-                score = -negamax(newBoard, depth - 1, -beta, -alpha, -color, nextState, initialMaxDepth);
+                int score;
+                if (reduction > 0) {
+                    score = -negamax(board, depth - 2, -alpha - 1, -alpha, -color, nextState, initialMaxDepth);
+                    if (score > alpha) {
+                        score = -negamax(board, depth - 1, -alpha - 1, -alpha, -color, nextState, initialMaxDepth);
+                    }
+                } else {
+                    score = -negamax(board, depth - 1, -alpha - 1, -alpha, -color, nextState, initialMaxDepth);
+                }
+
+                // If the zero window search failed high (score > alpha) and within beta,
+                // it means this move might be better than the current PV. Re-search with full window.
+                if (score > alpha && score < beta) {
+                    score = -negamax(board, depth - 1, -beta, -alpha, -color, nextState, initialMaxDepth);
+                }
+
+                // Update best value and best move if a better move is found
+                if (score > bestValue) {
+                    bestValue = score;
+                    bestMove = move;
+                }
+                if (score >= beta) {
+                    historyTable[color == 1 ? 1 : 0][move.fromRow * 64 + move.toRow * 8 + move.toCol] += depth * depth;
+                    killerMoves[ply][1] = killerMoves[ply][0];
+                    killerMoves[ply][0] = move;
+                    break;
+                }
+                alpha = Math.max(alpha, bestValue); // Update alpha
+            } finally {
+                undoMove(board, move);
             }
-
-            // Update best value and best move if a better move is found
-            if (score > bestValue) {
-                bestValue = score;
-                bestMove = move;
-            }
-            alpha = Math.max(alpha, bestValue); // Update alpha
         }
 
 
@@ -412,7 +469,7 @@ public class Minimax {
             entryType = EntryType.EXACT;
         }
         // Store entry with current hash, depth, score, best move found, and type
-        transpositionTable.put(currentHash, new TranspositionEntry(currentHash, depth, bestValue, bestMove, entryType));
+        ttStore(currentHash, depth, bestValue, bestMove, entryType);
 
         return bestValue;
     }
@@ -424,13 +481,16 @@ public class Minimax {
      * @param beta Upper bound.
      * @param color 1 for maximizing player (Black), -1 for minimizing (White).
      * @param boardState Current board state info (hash, castling, EP).
+     * @param ply The ply distance from the root.
      * @return Stable evaluation score.
      */
-    public static int quiescenceSearch(Piece[][] board, int alpha, int beta, int color, BoardStateInfo boardState) {
+    public static int quiescenceSearch(Piece[][] board, int alpha, int beta, int color, BoardStateInfo boardState, int ply) {
+        nodesSearched++;
+        if ((nodesSearched & 1023) == 0 && System.currentTimeMillis() > searchDeadline) throw new SearchAborted();
         long currentHash = boardState.zobristHash;
 
         // --- Transposition Table Lookup ---
-        TranspositionEntry entry = transpositionTable.get(currentHash);
+        TranspositionEntry entry = ttProbe(currentHash);
          if (entry != null && entry.zobristHash == currentHash && entry.depth >= 0) { // Depth 0 for quiescence nodes
              switch (entry.type) {
                  case EXACT: return entry.value;
@@ -449,13 +509,14 @@ public class Minimax {
         // --- Beta Cutoff (Fail High) ---
         if (standPat >= beta) {
              // Store TT entry (LOWERBOUND)
-             transpositionTable.put(currentHash, new TranspositionEntry(currentHash, 0, standPat, null, EntryType.LOWERBOUND));
+             ttStore(currentHash, 0, standPat, null, EntryType.LOWERBOUND);
             return beta;
         }
 
-        // --- Delta Pruning (Optional Optimization) ---
-        // If standPat + biggest_possible_gain < alpha, prune (e.g., standPat + QueenValue < alpha)
-        // if (standPat + QUEEN_VALUE < alpha) { return alpha; }
+        // --- Delta Pruning ---
+        if (standPat + QUEEN_VALUE < alpha) {
+            return alpha;
+        }
 
 
         // --- Update Alpha (Lower Bound) ---
@@ -463,34 +524,36 @@ public class Minimax {
 
         // --- Generate and Explore "Interesting" Moves (Captures and Promotions primarily) ---
         // Checks can sometimes be included but can lead to infinite loops if not careful
-        List<Move> interestingMoves = generateMoves(board, isBlackTurn, true); // Order moves
+        List<Move> interestingMoves = generateMoves(board, isBlackTurn, true, boardState, ply);
         // Keep only captures and promotions for standard quiescence
         interestingMoves.removeIf(move -> !move.wasPromotion && board[move.toRow][move.toCol] == null && !isEnPassantCapture(board, move));
 
         int bestValue = standPat; // Initialize with stand-pat score
 
         for (Move move : interestingMoves) {
-            Piece[][] newBoard = copyBoard(board);
-            BoardStateInfo nextState = applyMove(newBoard, move, boardState);
+            BoardStateInfo nextState = applyMove(board, move, boardState);
+            try {
+                // Recursively call quiescence search for the opponent
+                int score = -quiescenceSearch(board, -beta, -alpha, -color, nextState, ply);
 
-            // Recursively call quiescence search for the opponent
-            int score = -quiescenceSearch(newBoard, -beta, -alpha, -color, nextState);
+                // Update best value
+                bestValue = Math.max(bestValue, score);
 
-             // Update best value
-             bestValue = Math.max(bestValue, score);
-
-            // --- Alpha Update and Beta Cutoff ---
-            alpha = Math.max(alpha, bestValue);
-            if (alpha >= beta) {
-                 // Store TT entry (LOWERBOUND)
-                 transpositionTable.put(currentHash, new TranspositionEntry(currentHash, 0, bestValue, move, EntryType.LOWERBOUND));
-                return beta; // Prune (Fail High)
+                // --- Alpha Update and Beta Cutoff ---
+                alpha = Math.max(alpha, bestValue);
+                if (alpha >= beta) {
+                     // Store TT entry (LOWERBOUND)
+                     ttStore(currentHash, 0, bestValue, move, EntryType.LOWERBOUND);
+                    return beta; // Prune (Fail High)
+                }
+            } finally {
+                undoMove(board, move);
             }
         }
 
          // --- Store Final Result in TT ---
          EntryType entryType = (bestValue <= standPat) ? EntryType.UPPERBOUND : EntryType.EXACT;
-         transpositionTable.put(currentHash, new TranspositionEntry(currentHash, 0, bestValue, null, entryType));
+         ttStore(currentHash, 0, bestValue, null, entryType);
 
         return bestValue; // Return the best score found
     }
@@ -511,11 +574,24 @@ public class Minimax {
      * @return The best Move found.
      */
     public static Move getBestMove(Piece[][] board, int maxSearchDepth, boolean blackTurn) {
-        transpositionTable.clear(); // Clear TT for new search
+        return getBestMove(board, maxSearchDepth, blackTurn, Long.MAX_VALUE, -1);
+    }
+
+    public static Move getBestMove(Piece[][] board, int maxSearchDepth, boolean blackTurn, long timeLimitMs) {
+        return getBestMove(board, maxSearchDepth, blackTurn, timeLimitMs, -1);
+    }
+
+    public static Move getBestMove(Piece[][] board, int maxSearchDepth, boolean blackTurn, long timeLimitMs, int enPassantTargetFile) {
+        Arrays.fill(transpositionTable, null); // Clear TT for new search
+        for (int i = 0; i < historyTable.length; i++) Arrays.fill(historyTable[i], 0);
+        for (int i = 0; i < killerMoves.length; i++) { killerMoves[i][0] = null; killerMoves[i][1] = null; }
         zobrist.initialize(); // Ensure Zobrist keys are ready
+        nodesSearched = 0;
+        searchDeadline = (timeLimitMs >= Long.MAX_VALUE - 1000) ? Long.MAX_VALUE : System.currentTimeMillis() + timeLimitMs;
 
         // Calculate initial board state (including hash)
         BoardStateInfo initialState = getBoardStateInfo(board);
+        initialState.enPassantTargetFile = enPassantTargetFile; // Carry over GUI-tracked EP target
         initialState.zobristHash = zobrist.calculateBoardHash(board, initialState, blackTurn);
 
         Move bestMoveOverall = null;
@@ -530,11 +606,16 @@ public class Minimax {
         for (int depth = 1; depth <= maxSearchDepth; depth++) {
             long startTime = System.currentTimeMillis();
 
-            // Negamax call for the current depth
-            int currentEval = negamax(board, depth, Integer.MIN_VALUE + 1, Integer.MAX_VALUE - 1, color, initialState, depth); // Pass current depth as initialMaxDepth for this iteration
+            int currentEval;
+            try {
+                currentEval = negamax(board, depth, Integer.MIN_VALUE + 1, Integer.MAX_VALUE - 1, color, initialState, depth);
+            } catch (SearchAborted e) {
+                System.out.printf("Depth %d: search aborted (time limit exceeded)\n", depth);
+                break;
+            }
 
             // Retrieve the best move for this depth from the TT (stored by negamax)
-            TranspositionEntry rootEntry = transpositionTable.get(initialState.zobristHash);
+            TranspositionEntry rootEntry = ttProbe(initialState.zobristHash);
             // Ensure entry exists, matches hash, has a move, and is from this depth or deeper
             Move currentBestMove = (rootEntry != null && rootEntry.zobristHash == initialState.zobristHash && rootEntry.bestMove != null && rootEntry.depth >= depth)
                                    ? rootEntry.bestMove : null;
@@ -578,46 +659,52 @@ public class Minimax {
 
     // --- Board and Move Utility Methods ---
 
-    /** Creates a deep copy of the board state. */
-    public static Piece[][] copyBoard(Piece[][] board) {
-        Piece[][] newBoard = new Piece[board.length][board[0].length];
-        for (int r = 0; r < board.length; r++) {
-            for (int c = 0; c < board[r].length; c++) {
-                if (board[r][c] != null) {
-                     try {
-                         newBoard[r][c] = createPieceCopy(board[r][c]);
-                     } catch (Exception e) {
-                         System.err.println("FATAL: Piece cloning failed: " + e.getMessage());
-                         return null; // Indicate failure
-                     }
-                } else {
-                    newBoard[r][c] = null;
-                }
-            }
-        }
-        return newBoard;
+    private static TranspositionEntry ttProbe(long hash) {
+        TranspositionEntry e = transpositionTable[(int) (hash & (transpositionTable.length - 1))];
+        return (e != null && e.zobristHash == hash) ? e : null;
     }
 
-     /** Helper to create a copy of a piece. */
-     private static Piece createPieceCopy(Piece original) {
-         if (original == null) return null;
-         Piece copy = null; Color color = original.getColor();
-         switch (original.getPieceType()) {
-             case "pawn":   copy = new Pawn(color); break; case "knight": copy = new Knight(color); break;
-             case "bishop": copy = new Bishop(color); break; case "rook":   copy = new Rook(color); break;
-             case "queen":  copy = new Queen(color); break; case "king":   copy = new King(color); break;
-             default: throw new IllegalArgumentException("Unknown piece type: " + original.getPieceType());
-         }
-         copy.setHasMoved(original.hasMoved());
-         if (original instanceof Pawn && copy instanceof Pawn) {
-              ((Pawn) copy).setJustMadeDoubleMove(((Pawn) original).getJustMadeDoubleMove());
-         }
-         if (original instanceof King && copy instanceof King) {
-             ((King) copy).setPosition(((King) original).getRow(), ((King) original).getCol());
-         }
-         return copy;
-     }
+    private static void ttStore(long hash, int depth, int value, Move bestMove, EntryType type) {
+        TranspositionEntry[] t = transpositionTable;
+        int slot = (int) (hash & (t.length - 1));
+        TranspositionEntry e = t[slot];
+        if (e == null || e.zobristHash != hash || depth >= e.depth) {
+            if (e == null) {
+                t[slot] = new TranspositionEntry(hash, depth, value, bestMove, type);
+            } else {
+                e.zobristHash = hash;
+                e.depth = depth;
+                e.value = value;
+                e.bestMove = bestMove;
+                e.type = type;
+            }
+        }
+    }
 
+    /** Reverts a move applied with applyMove, restoring the board and piece state. */
+    private static void undoMove(Piece[][] board, Move move) {
+        if (move.wasCastling) {
+            Piece rook = board[move.rookToRow][move.rookToCol];
+            board[move.rookFromRow][move.rookFromCol] = rook;
+            board[move.rookToRow][move.rookToCol] = null;
+            if (rook != null) rook.setHasMoved(move.rookHadMoved);
+        }
+        if (move.wasEnPassant) {
+            board[move.toRow][move.toCol] = null;
+            board[move.fromRow][move.toCol] = move.capturedPiece;
+        } else {
+            board[move.toRow][move.toCol] = move.capturedPiece;
+        }
+        Piece moved = move.movedPiece;
+        board[move.fromRow][move.fromCol] = moved;
+        moved.setHasMoved(move.movedPieceHadMoved);
+        if (moved instanceof King) {
+            ((King) moved).setPosition(move.fromRow, move.fromCol);
+        }
+        if (moved instanceof Pawn) {
+            ((Pawn) moved).setJustMadeDoubleMove(move.preMovedDoubleFlag);
+        }
+    }
 
     /**
      * Applies a move to the board state and calculates the *next* BoardStateInfo
@@ -630,6 +717,7 @@ public class Minimax {
     public static BoardStateInfo applyMove(Piece[][] board, Move move, BoardStateInfo previousState) {
         long currentHash = previousState.zobristHash;
         Piece movedPiece = board[move.fromRow][move.fromCol];
+        move.preMovedDoubleFlag = movedPiece instanceof Pawn && ((Pawn) movedPiece).getJustMadeDoubleMove();
 
         // Store previous state info needed for hash updates
         int prevEnPassantTargetFile = previousState.enPassantTargetFile;
@@ -682,6 +770,7 @@ public class Minimax {
                  currentHash ^= zobrist.getPieceHash(capturedPiece, capturedPawnRow, capturedPawnCol); // XOR out captured EP pawn
                  board[capturedPawnRow][capturedPawnCol] = null; // Remove from board
                  move.capturedPiece = capturedPiece; // Ensure move object knows about capture
+                 move.wasEnPassant = true;
                  isEnPassant = true;
             }
         } else if (capturedPiece != null) {
@@ -726,9 +815,7 @@ public class Minimax {
         }
 
         // 5. --- Update Piece State (hasMoved, King position, Pawn double move) ---
-        if (!move.wasCastling) { // King/Rook hasMoved updated by castling rights logic
-             movedPiece.setHasMoved(true);
-        }
+        movedPiece.setHasMoved(true);
         if (movedPiece instanceof King) {
              ((King) movedPiece).setPosition(move.toRow, move.toCol);
         }
@@ -764,9 +851,35 @@ public class Minimax {
 
     /** Generates legal moves for the specified player. */
     public static List<Move> generateMoves(Piece[][] board, boolean blackTurn, boolean ordered) {
+        return generateMoves(board, blackTurn, ordered, getBoardStateInfo(board), 0);
+    }
+
+    /** Generates legal moves using an externally tracked en passant target file (0-7, or -1). */
+    public static List<Move> generateMoves(Piece[][] board, boolean blackTurn, boolean ordered, int enPassantTargetFile) {
+        BoardStateInfo state = getBoardStateInfo(board);
+        state.enPassantTargetFile = enPassantTargetFile;
+        return generateMoves(board, blackTurn, ordered, state, 0);
+    }
+
+    /**
+     * Computes a Zobrist position key for the current board, used by the GUI
+     * for threefold-repetition detection. Includes piece placement, side to move,
+     * castling rights, and the en passant target file.
+     */
+    public static long computePositionKey(Piece[][] board, boolean blackTurn, int enPassantTargetFile) {
+        zobrist.initialize();
+        BoardStateInfo state = getBoardStateInfo(board);
+        state.enPassantTargetFile = enPassantTargetFile;
+        return zobrist.calculateBoardHash(board, state, blackTurn);
+    }
+
+    public static List<Move> generateMoves(Piece[][] board, boolean blackTurn, boolean ordered, BoardStateInfo state) {
+        return generateMoves(board, blackTurn, ordered, state, 0);
+    }
+
+    public static List<Move> generateMoves(Piece[][] board, boolean blackTurn, boolean ordered, BoardStateInfo state, int ply) {
         List<Move> pseudoMoves = new ArrayList<>();
         Color playerColor = blackTurn ? Color.BLACK : Color.WHITE;
-        BoardStateInfo currentState = getBoardStateInfo(board); // Get EP target, castling rights
 
         for (int r = 0; r < board.length; r++) {
             for (int c = 0; c < board[r].length; c++) {
@@ -774,16 +887,16 @@ public class Minimax {
                 if (p != null && p.getColor().equals(playerColor)) {
                     generatePieceMoves(board, r, c, p, pseudoMoves);
                     if (p instanceof King && !p.hasMoved()) {
-                        addCastlingMoves(board, r, c, (King)p, pseudoMoves, currentState);
+                        addCastlingMoves(board, r, c, (King)p, pseudoMoves, state);
                     }
                     if (p instanceof Pawn) {
-                        addEnPassantMoves(board, r, c, (Pawn)p, pseudoMoves, currentState.enPassantTargetFile);
+                        addEnPassantMoves(board, r, c, (Pawn)p, pseudoMoves, state.enPassantTargetFile);
                     }
                 }
             }
         }
-        List<Move> legalMoves = filterLegalMoves(board, pseudoMoves, blackTurn);
-        if (ordered) { orderMoves(board, legalMoves); }
+        List<Move> legalMoves = filterLegalMoves(board, pseudoMoves, blackTurn, state);
+        if (ordered) { orderMoves(board, legalMoves, ply); }
         return legalMoves;
     }
 
@@ -865,58 +978,20 @@ public class Minimax {
 
 
     /** Filters pseudo-legal moves for legality (king safety). */
-    private static List<Move> filterLegalMoves(Piece[][] board, List<Move> pseudoMoves, boolean blackTurn) {
+    private static List<Move> filterLegalMoves(Piece[][] board, List<Move> pseudoMoves, boolean blackTurn, BoardStateInfo state) {
         List<Move> legalMoves = new ArrayList<>();
         Color kingColor = blackTurn ? Color.BLACK : Color.WHITE;
-        BoardStateInfo initialInfo = getBoardStateInfo(board); // Needed for applyMove
 
         for (Move move : pseudoMoves) {
-            Piece[][] tempBoard = copyBoard(board);
-            if (tempBoard == null) continue;
-            // Apply move temporarily - use a version that doesn't need full state if possible,
-            // but applyMoveForCheckTest needs updating to handle state correctly or applyMove used carefully.
-            // For simplicity, we might re-use applyMove but discard the returned state.
-            // Using applyMoveForCheckTest which updates king position internally.
-            applyMoveForCheckTest(tempBoard, move); // This needs to be robust
-
-            int[] kingPos = findKing(tempBoard, kingColor);
-            if (kingPos != null && !isKingInCheck(tempBoard, kingColor)) {
+            applyMove(board, move, state);
+            int[] kingPos = findKing(board, kingColor);
+            if (kingPos != null && !isKingInCheck(board, kingColor)) {
                 legalMoves.add(move);
             }
+            undoMove(board, move);
         }
         return legalMoves;
     }
-
-    /** Simplified applyMove for check testing - needs careful state handling or replacement. */
-     private static void applyMoveForCheckTest(Piece[][] board, Move move) {
-         Piece pieceToMove = board[move.fromRow][move.fromCol];
-         if (pieceToMove == null) return;
-
-         // Handle en passant capture target removal
-         if (pieceToMove.getPieceType().equals("pawn") && move.fromCol != move.toCol && board[move.toRow][move.toCol] == null) {
-             board[move.fromRow][move.toCol] = null;
-         }
-         // Move the piece
-         board[move.toRow][move.toCol] = pieceToMove;
-         board[move.fromRow][move.fromCol] = null;
-         // Handle castling rook move
-         if (move.wasCastling) {
-             Piece rook = board[move.rookFromRow][move.rookFromCol]; // Find rook at source
-             if (rook != null) {
-                 board[move.rookToRow][move.rookToCol] = rook;
-                 board[move.rookFromRow][move.rookFromCol] = null;
-             }
-         }
-         // Handle promotion
-         if (move.wasPromotion) {
-             board[move.toRow][move.toCol] = new Queen(pieceToMove.getColor());
-             if (pieceToMove instanceof King) pieceToMove = board[move.toRow][move.toCol];
-         }
-         // Update King's internal position
-         if (pieceToMove instanceof King) {
-             ((King) pieceToMove).setPosition(move.toRow, move.toCol);
-         }
-     }
 
     /** Checks if the king of the specified color is currently under attack. */
     static boolean isKingInCheck(Piece[][] board, Color kingColor) {
@@ -957,22 +1032,23 @@ public class Minimax {
          return null;
     }
 
-    /** Checks if the given move results in a check to the opponent's king. */
-     private static boolean isCheck(Piece[][] board, Move move) {
-         Piece[][] tempBoard = copyBoard(board);
-         if (tempBoard == null) return false;
-         applyMoveForCheckTest(tempBoard, move);
-         Color opponentColor = move.movedPiece.getColor().equals(Color.WHITE) ? Color.BLACK : Color.WHITE;
-         return isKingInCheck(tempBoard, opponentColor);
-     }
-
     // --- Move Ordering ---
 
+
     /** Calculates a heuristic priority score for a move. */
-    private static int getMovePriority(Piece[][] board, Move move) {
+    private static int getMovePriority(Piece[][] board, Move move, int ply) {
         int priority = 0;
         Piece moved = board[move.fromRow][move.fromCol]; // Piece being moved
         if (moved == null) return Integer.MIN_VALUE; // Should not happen
+
+        Move killer0 = killerMoves[ply][0];
+        Move killer1 = killerMoves[ply][1];
+        if (killer0 != null && killer0.fromRow == move.fromRow && killer0.fromCol == move.fromCol && killer0.toRow == move.toRow && killer0.toCol == move.toCol) {
+            priority += 4000;
+        } else if (killer1 != null && killer1.fromRow == move.fromRow && killer1.fromCol == move.fromCol && killer1.toRow == move.toRow && killer1.toCol == move.toCol) {
+            priority += 3000;
+        }
+        priority += historyTable[moved.getColor().equals(Color.WHITE) ? 0 : 1][move.fromRow * 64 + move.toRow * 8 + move.toCol] / 32;
 
         Piece captured = null; // Piece captured (if any)
         boolean isEnPassant = moved.getPieceType().equals("pawn") && move.fromCol != move.toCol && board[move.toRow][move.toCol] == null;
@@ -982,17 +1058,6 @@ public class Minimax {
             captured = board[move.toRow][move.toCol]; // Standard capture target
         }
 
-        // 1. Checkmate bonus (highest priority)
-        Piece[][] tempBoardCheckmate = copyBoard(board);
-        if (tempBoardCheckmate != null) {
-            applyMoveForCheckTest(tempBoardCheckmate, move);
-            Color opponentColor = moved.getColor().equals(Color.WHITE) ? Color.BLACK : Color.WHITE;
-            if (isKingInCheck(tempBoardCheckmate, opponentColor)) {
-                 List<Move> opponentReplies = generateMoves(tempBoardCheckmate, !moved.getColor().equals(Color.WHITE), false);
-                 if (opponentReplies.isEmpty()) return 100000; // Checkmate!
-            }
-        }
-
         // 2. Promotion bonus
         if (move.wasPromotion) priority += 9000; // Assume Queen promotion value
 
@@ -1000,9 +1065,6 @@ public class Minimax {
         if (captured != null && captured.getColor() != moved.getColor()) {
              priority += 1000 + (getPieceValue(captured) * 10) - getPieceValue(moved);
         }
-
-        // 4. Check bonus
-        if (isCheck(board, move)) priority += 500;
 
         // 5. Castling bonus
         if (move.wasCastling) priority += 300;
@@ -1017,10 +1079,10 @@ public class Minimax {
     }
 
     /** Sorts moves in descending order based on priority. */
-    private static void orderMoves(Piece[][] board, List<Move> moves) {
+    private static void orderMoves(Piece[][] board, List<Move> moves, int ply) {
         moves.sort((m1, m2) -> {
             if (m1 == null && m2 == null) return 0; if (m1 == null) return 1; if (m2 == null) return -1;
-            return Integer.compare(getMovePriority(board, m2), getMovePriority(board, m1));
+            return Integer.compare(getMovePriority(board, m2, ply), getMovePriority(board, m1, ply));
         });
     }
 

@@ -13,6 +13,15 @@ public class Move {
     // For pawn promotion
     public boolean wasPromotion;
     public Piece prePromotionPiece;
+
+    // For search make/unmake
+    public boolean wasEnPassant;
+    public boolean preMovedDoubleFlag;
+    
+    // For GUI undo of en passant target and draw-rule bookkeeping.
+    public int epBeforeMove = -1;
+    public int halfmoveBefore = 0;
+    public long positionKeyAfter;
     
     // Default constructor
     public Move() { }

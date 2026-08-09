@@ -1,6 +1,10 @@
 # Build output
 bin/
+out/
 *.class
+
+# Test harnesses
+bench/
 
 # Eclipse IDE
 .settings/

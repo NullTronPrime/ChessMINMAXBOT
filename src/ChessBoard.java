@@ -11,6 +11,7 @@ import java.awt.Point;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.awt.image.BufferedImage;
+import java.io.File;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
@@ -50,6 +51,16 @@ public class ChessBoard extends JFrame {
     private King whiteKing;
     private King blackKing;
     private List<Point> validMoves = new ArrayList<>();
+    
+    // En passant target file (0-7) or -1 if none; updated after each move.
+    private int enPassantTargetFile = -1;
+    // Halfmove clock for the 50-move rule.
+    private int halfmoveClock = 0;
+    // Position repetition counts for the threefold repetition rule.
+    private Map<Long, Integer> positionCounts = new HashMap<>();
+    // True while the bot is thinking (blocks user input).
+    private boolean botThinking = false;
+    private JButton botMoveButton;
     
     // New progress bar for minimax calculation.
     private JProgressBar progressBar;
@@ -151,6 +162,7 @@ public class ChessBoard extends JFrame {
         fullBoardPanel.add(rankPanel, BorderLayout.WEST);
         fullBoardPanel.add(gridPanel, BorderLayout.CENTER);
         add(fullBoardPanel, BorderLayout.CENTER);
+        positionCounts.put(Minimax.computePositionKey(pieces, !whiteTurn, enPassantTargetFile), 1);
         
         // Control panel.
         JPanel controlPanel = new JPanel();
@@ -169,16 +181,22 @@ public class ChessBoard extends JFrame {
             usePngImages = !usePngImages;
             loadPieceIcons();
             updateBoardIcons();
+            updateCapturedPiecesDisplay();
         });
-        JButton botMoveButton = new JButton("Bot Move (Black)");
+        botMoveButton = new JButton("Bot Move (Black)");
         botMoveButton.addActionListener(new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
+                if (botThinking) {
+                    return;
+                }
                 if (whiteTurn) {
                     JOptionPane.showMessageDialog(null, "It is not Black's turn!");
                     return;
                 }
                 // Start minimax search in a background thread.
+                botThinking = true;
+                botMoveButton.setEnabled(false);
                 MinimaxWorker worker = new MinimaxWorker(7); // Increase depth as desired.
                 worker.execute();
             }
@@ -218,17 +236,30 @@ public class ChessBoard extends JFrame {
             for (String pieceType : pieceTypes) {
                 String key = color + "_" + pieceType;
                 if (usePngImages) {
+                    BufferedImage img = null;
                     try {
                         URL url = getClass().getResource("/" + color.charAt(0) + "_" + pieceType + ".png");
-                        if (url != null) {
-                            BufferedImage img = ImageIO.read(url);
-                            Image resized = img.getScaledInstance(SQUARE_SIZE - 10, SQUARE_SIZE - 10, Image.SCALE_SMOOTH);
-                            pieceIcons.put(key, new ImageIcon(resized));
-                        } else {
-                            createFallbackIcon(color, pieceType, key);
-                        }
+                        if (url != null)
+                            img = ImageIO.read(url);
                     } catch (Exception ex) {
-                        System.err.println("Error loading image for " + key + ": " + ex.getMessage());
+                        System.err.println("Error loading classpath image for " + key + ": " + ex.getMessage());
+                    }
+                    // PNGs ship in src/ but may not be on the classpath; fall back to the filesystem.
+                    if (img == null) {
+                        File file = new File("src" + File.separator + color.charAt(0) + "_" + pieceType + ".png");
+                        if (!file.exists())
+                            file = new File(color.charAt(0) + "_" + pieceType + ".png");
+                        try {
+                            if (file.exists())
+                                img = ImageIO.read(file);
+                        } catch (Exception ex) {
+                            System.err.println("Error loading image file for " + key + ": " + ex.getMessage());
+                        }
+                    }
+                    if (img != null) {
+                        Image resized = img.getScaledInstance(SQUARE_SIZE - 10, SQUARE_SIZE - 10, Image.SCALE_SMOOTH);
+                        pieceIcons.put(key, new ImageIcon(resized));
+                    } else {
                         createFallbackIcon(color, pieceType, key);
                     }
                 } else {
@@ -357,6 +388,8 @@ public class ChessBoard extends JFrame {
     
     // If a move is made by the user.
     private void handleMove(int row, int col) {
+        if (botThinking)
+            return;
         if (selectedSquare == null) {
             if (pieces[row][col] != null && pieces[row][col].getColor().equals(whiteTurn ? Color.WHITE : Color.BLACK)) {
                 selectedSquare = squares[row][col];
@@ -385,64 +418,105 @@ public class ChessBoard extends JFrame {
             }
             if (valid) {
                 Move move = new Move();
-                move.fromRow = getRow(selectedSquare);
-                move.fromCol = getCol(selectedSquare);
+                move.fromRow = fromRow;
+                move.fromCol = fromCol;
                 move.toRow = row;
                 move.toCol = col;
-                move.movedPiece = pieces[move.fromRow][move.fromCol];
-                move.movedPieceHadMoved = move.movedPiece.hasMoved();
-                move.capturedPiece = pieces[row][col]; // may be null
-                // If capturing, add to captured pieces.
-                if (pieces[row][col] != null) {
-                    capturedPieces.add(pieces[row][col]);
-                    updateCapturedPiecesDisplay();
-                }
-                if (move.movedPiece instanceof King && Math.abs(getCol(selectedSquare) - col) == 2) {
-                    move.wasCastling = true;
-                    if (col > getCol(selectedSquare)) {
-                        move.rookFromRow = move.fromRow;
-                        move.rookFromCol = 7;
-                        move.rookToRow = move.fromRow;
-                        move.rookToCol = col - 1;
-                    } else {
-                        move.rookFromRow = move.fromRow;
-                        move.rookFromCol = 0;
-                        move.rookToRow = move.fromRow;
-                        move.rookToCol = col + 1;
-                    }
-                    move.rookPiece = pieces[move.fromRow][move.rookFromCol];
-                    move.rookHadMoved = move.rookPiece.hasMoved();
-                    handleCastling(move.fromRow, move.fromCol, row, col);
-                } else {
-                    if (move.movedPiece instanceof Pawn && ((Pawn) move.movedPiece).shouldPromote(row)) {
-                        move.wasPromotion = true;
-                        move.prePromotionPiece = move.movedPiece;
-                    }
-                    movePiece(selectedSquare, squares[row][col]);
-                }
-                moveHistory.push(move);
-                boolean inCheck = isKingInCheck(!whiteTurn);
-                whiteTurn = !whiteTurn;
-                updateTurnLabel();
-                if (inCheck) {
-                    statusLabel.setText((!whiteTurn ? "White" : "Black") + " is in check!");
-                    highlightKingInCheck(!whiteTurn);
-                    if (isCheckmate(!whiteTurn)) {
-                        statusLabel.setText("Checkmate! " + (whiteTurn ? "White" : "Black") + " wins!");
-                        gameOver = true;
-                    }
-                } else {
-                    statusLabel.setText("Game in progress");
-                    if (isStalemate(!whiteTurn)) {
-                        statusLabel.setText("Stalemate! Game ends in a draw.");
-                        gameOver = true;
-                    }
-                }
+                applyMoveToBoard(move);
                 selectedSquare = null;
                 validMoves.clear();
                 resetSquareColors();
             } else {
                 System.out.println("Invalid move");
+            }
+        }
+    }
+    
+    // Fills in move metadata, executes the move on the board, and updates game state.
+    private void applyMoveToBoard(Move move) {
+        move.movedPiece = pieces[move.fromRow][move.fromCol];
+        move.movedPieceHadMoved = move.movedPiece.hasMoved();
+        move.epBeforeMove = enPassantTargetFile;
+        move.halfmoveBefore = halfmoveClock;
+        if (move.movedPiece instanceof Pawn)
+            move.preMovedDoubleFlag = ((Pawn) move.movedPiece).getJustMadeDoubleMove();
+        boolean wasEnPassant = move.movedPiece instanceof Pawn
+                && move.toCol != move.fromCol
+                && pieces[move.toRow][move.toCol] == null;
+        if (wasEnPassant) {
+            move.wasEnPassant = true;
+            move.capturedPiece = pieces[move.fromRow][move.toCol];
+            if (move.capturedPiece != null) {
+                capturedPieces.add(move.capturedPiece);
+                updateCapturedPiecesDisplay();
+            }
+        } else {
+            move.capturedPiece = pieces[move.toRow][move.toCol];
+            if (move.capturedPiece != null) {
+                capturedPieces.add(move.capturedPiece);
+                updateCapturedPiecesDisplay();
+            }
+        }
+        if (move.movedPiece instanceof King && Math.abs(move.fromCol - move.toCol) == 2) {
+            move.wasCastling = true;
+            if (move.toCol > move.fromCol) {
+                move.rookFromCol = 7;
+                move.rookToCol = move.toCol - 1;
+            } else {
+                move.rookFromCol = 0;
+                move.rookToCol = move.toCol + 1;
+            }
+            move.rookFromRow = move.fromRow;
+            move.rookToRow = move.fromRow;
+            move.rookPiece = pieces[move.fromRow][move.rookFromCol];
+            move.rookHadMoved = move.rookPiece.hasMoved();
+            handleCastling(move.fromRow, move.fromCol, move.toRow, move.toCol);
+        } else {
+            if (move.movedPiece instanceof Pawn && ((Pawn) move.movedPiece).shouldPromote(move.toRow)) {
+                move.wasPromotion = true;
+                move.prePromotionPiece = move.movedPiece;
+            }
+            movePiece(squares[move.fromRow][move.fromCol], squares[move.toRow][move.toCol]);
+        }
+        completeMove(move);
+    }
+    
+    // Applies draw-rule bookkeeping (50-move rule, threefold repetition), flips the
+    // turn, and evaluates check / checkmate / stalemate after a move is executed.
+    private void completeMove(Move move) {
+        moveHistory.push(move);
+        if (move.movedPiece instanceof Pawn || move.capturedPiece != null)
+            halfmoveClock = 0;
+        else
+            halfmoveClock++;
+        if (move.movedPiece instanceof Pawn && Math.abs(move.toRow - move.fromRow) == 2)
+            enPassantTargetFile = move.fromCol;
+        else
+            enPassantTargetFile = -1;
+        whiteTurn = !whiteTurn;
+        updateTurnLabel();
+        long key = Minimax.computePositionKey(pieces, !whiteTurn, enPassantTargetFile);
+        move.positionKeyAfter = key;
+        int count = positionCounts.merge(key, 1, Integer::sum);
+        boolean inCheck = isKingInCheck(whiteTurn);
+        if (inCheck) {
+            statusLabel.setText((whiteTurn ? "White" : "Black") + " is in check!");
+            highlightKingInCheck(whiteTurn);
+            if (isCheckmate(whiteTurn)) {
+                statusLabel.setText("Checkmate! " + (whiteTurn ? "Black" : "White") + " wins!");
+                gameOver = true;
+            }
+        } else {
+            statusLabel.setText("Game in progress");
+            if (isStalemate(whiteTurn)) {
+                statusLabel.setText("Stalemate! Game ends in a draw.");
+                gameOver = true;
+            } else if (halfmoveClock >= 100) {
+                statusLabel.setText("Draw! 50-move rule.");
+                gameOver = true;
+            } else if (count >= 3) {
+                statusLabel.setText("Draw! Threefold repetition.");
+                gameOver = true;
             }
         }
     }
@@ -453,22 +527,17 @@ public class ChessBoard extends JFrame {
     }
     
     private void findAndHighlightValidMoves(int row, int col) {
-        Piece piece = pieces[row][col];
         validMoves.clear();
-        for (int i = 0; i < BOARD_SIZE; i++) {
-            for (int j = 0; j < BOARD_SIZE; j++) {
-                if (piece.isValidMove(row, col, i, j, pieces))
-                    if (!wouldMoveExposeKing(row, col, i, j)) {
-                        validMoves.add(new Point(i, j));
-                        if (pieces[i][j] == null)
-                            squares[i][j].setBackground(validMoveColor);
-                        else
-                            squares[i][j].setBorder(BorderFactory.createLineBorder(validMoveColor, 3));
-                    }
+        List<Move> legalMoves = Minimax.generateMoves(pieces, !whiteTurn, false, enPassantTargetFile);
+        for (Move m : legalMoves) {
+            if (m.fromRow == row && m.fromCol == col) {
+                validMoves.add(new Point(m.toRow, m.toCol));
+                if (pieces[m.toRow][m.toCol] == null)
+                    squares[m.toRow][m.toCol].setBackground(validMoveColor);
+                else
+                    squares[m.toRow][m.toCol].setBorder(BorderFactory.createLineBorder(validMoveColor, 3));
             }
         }
-        if (piece instanceof King && !((King) piece).hasMoved())
-            checkAndHighlightCastling(row, col);
     }
     
     private void checkAndHighlightCastling(int row, int col) {
@@ -513,6 +582,8 @@ public class ChessBoard extends JFrame {
         int fromRow = getRow(from), fromCol = getCol(from);
         int toRow = getRow(to), toCol = getCol(to);
         Piece piece = pieces[fromRow][fromCol];
+        // En passant: diagonal pawn move onto an empty square.
+        boolean wasEnPassant = piece instanceof Pawn && fromCol != toCol && pieces[toRow][toCol] == null;
         pieces[toRow][toCol] = piece;
         pieces[fromRow][fromCol] = null;
         to.setIcon(from.getIcon());
@@ -527,7 +598,7 @@ public class ChessBoard extends JFrame {
                 blackKing.setPosition(toRow, toCol);
         } else if (piece instanceof Pawn) {
             ((Pawn) piece).setJustMadeDoubleMove(Math.abs(toRow - fromRow) == 2);
-            if (fromCol != toCol && pieces[toRow][toCol] == null) {
+            if (wasEnPassant) {
                 pieces[fromRow][toCol] = null;
                 squares[fromRow][toCol].setIcon(null);
             }
@@ -562,32 +633,59 @@ public class ChessBoard extends JFrame {
     }
     
     private void undoMove() {
-        if (moveHistory.isEmpty()) return;
+        if (moveHistory.isEmpty() || botThinking) return;
         Move last = moveHistory.pop();
         int fr = last.fromRow, fc = last.fromCol, tr = last.toRow, tc = last.toCol;
         pieces[fr][fc] = last.movedPiece;
-        pieces[tr][tc] = last.capturedPiece;
         last.movedPiece.setHasMoved(last.movedPieceHadMoved);
+        if (last.movedPiece instanceof Pawn)
+            ((Pawn) last.movedPiece).setJustMadeDoubleMove(last.preMovedDoubleFlag);
+        if (last.wasEnPassant) {
+            pieces[tr][tc] = null;
+            if (last.capturedPiece != null) {
+                pieces[fr][tc] = last.capturedPiece;
+                ((Pawn) last.capturedPiece).setJustMadeDoubleMove(true);
+            }
+        } else {
+            pieces[tr][tc] = last.capturedPiece;
+        }
         if (last.capturedPiece != null)
             capturedPieces.remove(last.capturedPiece);
+        updateCapturedPiecesDisplay();
         if (last.wasCastling) {
             pieces[last.rookFromRow][last.rookFromCol] = last.rookPiece;
             pieces[last.rookToRow][last.rookToCol] = null;
             last.rookPiece.setHasMoved(last.rookHadMoved);
             squares[last.rookFromRow][last.rookFromCol].setIcon(pieceIcons.get(
                 (last.rookPiece.getColor().equals(Color.WHITE) ? "white_" : "black_") + last.rookPiece.getPieceType()));
+            squares[last.rookToRow][last.rookToCol].setIcon(null);
         }
         if (last.wasPromotion)
             pieces[tr][tc] = last.prePromotionPiece;
         String keyFrom = (pieces[fr][fc].getColor().equals(Color.WHITE) ? "white_" : "black_") + pieces[fr][fc].getPieceType();
         squares[fr][fc].setIcon(pieceIcons.get(keyFrom));
+        if (last.wasEnPassant && last.capturedPiece != null) {
+            String keyCaptured = (last.capturedPiece.getColor().equals(Color.WHITE) ? "white_" : "black_")
+                    + last.capturedPiece.getPieceType();
+            squares[fr][tc].setIcon(pieceIcons.get(keyCaptured));
+        }
         if (pieces[tr][tc] != null) {
             String keyTo = (pieces[tr][tc].getColor().equals(Color.WHITE) ? "white_" : "black_") + pieces[tr][tc].getPieceType();
             squares[tr][tc].setIcon(pieceIcons.get(keyTo));
         } else {
             squares[tr][tc].setIcon(null);
         }
+        // Restore draw-rule bookkeeping state.
+        enPassantTargetFile = last.epBeforeMove;
+        halfmoveClock = last.halfmoveBefore;
+        int c = positionCounts.getOrDefault(last.positionKeyAfter, 0);
+        if (c <= 1)
+            positionCounts.remove(last.positionKeyAfter);
+        else
+            positionCounts.put(last.positionKeyAfter, c - 1);
         whiteTurn = !whiteTurn;
+        gameOver = false;
+        statusLabel.setText("Game in progress");
         updateTurnLabel();
         resetSquareColors();
     }
@@ -628,13 +726,13 @@ public class ChessBoard extends JFrame {
     private boolean isCheckmate(boolean isWhite) {
         if (!isKingInCheck(isWhite))
             return false;
-        return !canPlayerMakeAnyMove(isWhite);
+        return Minimax.generateMoves(pieces, !isWhite, false, enPassantTargetFile).isEmpty();
     }
     
     private boolean isStalemate(boolean isWhite) {
         if (isKingInCheck(isWhite))
             return false;
-        return !canPlayerMakeAnyMove(isWhite);
+        return Minimax.generateMoves(pieces, !isWhite, false, enPassantTargetFile).isEmpty();
     }
     
     private void highlightKingInCheck(boolean isWhite) {
@@ -662,6 +760,7 @@ public class ChessBoard extends JFrame {
     }
     
     private void resetGame() {
+        if (botThinking) return;
         for (int i = 0; i < BOARD_SIZE; i++)
             for (int j = 0; j < BOARD_SIZE; j++) {
                 pieces[i][j] = null;
@@ -675,6 +774,12 @@ public class ChessBoard extends JFrame {
         gameOver = false;
         capturedPieces.clear();
         moveHistory.clear();
+        enPassantTargetFile = -1;
+        halfmoveClock = 0;
+        positionCounts.clear();
+        botThinking = false;
+        if (botMoveButton != null)
+            botMoveButton.setEnabled(true);
         updateCapturedPiecesDisplay();
         for (int r = 0; r < BOARD_SIZE; r++) {
             for (int c = 0; c < BOARD_SIZE; c++) {
@@ -704,6 +809,7 @@ public class ChessBoard extends JFrame {
         }
         updateTurnLabel();
         statusLabel.setText("Game in progress");
+        positionCounts.put(Minimax.computePositionKey(pieces, !whiteTurn, enPassantTargetFile), 1);
         resetSquareColors();
     }
     
@@ -721,11 +827,13 @@ public class ChessBoard extends JFrame {
                 progressBar.setVisible(true);
             });
             // Perform minimax search.
-            Move bestMove = Minimax.getBestMove(pieces, depth,!whiteTurn);
+            Move bestMove = Minimax.getBestMove(pieces, depth, !whiteTurn, Long.MAX_VALUE, enPassantTargetFile);
             return bestMove;
         }
         @Override
         protected void done() {
+            botThinking = false;
+            botMoveButton.setEnabled(true);
             try {
                 Move bestMove = get();
                 if (bestMove != null) {
@@ -742,19 +850,13 @@ public class ChessBoard extends JFrame {
     }
     
     // Applies a move to the current board as selected by the bot.
-    private void makeMove(Move move) {
-        if (pieces[move.toRow][move.toCol] != null) {
-            capturedPieces.add(pieces[move.toRow][move.toCol]);
-            updateCapturedPiecesDisplay();
-        }
-        if (move.wasCastling) {
-            handleCastling(move.fromRow, move.fromCol, move.toRow, move.toCol);
-        } else {
-            movePiece(squares[move.fromRow][move.fromCol], squares[move.toRow][move.toCol]);
-        }
-        moveHistory.push(move);
-        whiteTurn = !whiteTurn;
-        updateTurnLabel();
+    private void makeMove(Move bestMove) {
+        Move move = new Move();
+        move.fromRow = bestMove.fromRow;
+        move.fromCol = bestMove.fromCol;
+        move.toRow = bestMove.toRow;
+        move.toCol = bestMove.toCol;
+        applyMoveToBoard(move);
         resetSquareColors();
     }
 }
