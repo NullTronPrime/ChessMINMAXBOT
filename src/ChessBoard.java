@@ -61,6 +61,16 @@ public class ChessBoard extends JFrame {
     // True while the bot is thinking (blocks user input).
     private boolean botThinking = false;
     private JButton botMoveButton;
+
+    // Bot auto-play modes: Manual (click for a one-off bot move), Half Auto (bot plays the
+    // side that was to move when the mode was activated), Full Auto (bot plays both sides).
+    private static final int MODE_MANUAL = 0;
+    private static final int MODE_HALF_AUTO = 1;
+    private static final int MODE_FULL_AUTO = 2;
+    private int autoMode = MODE_MANUAL;
+    private boolean botPlaysWhite = false;
+    private int botDepth = 9;
+    private boolean autoPromote = false; // Skip the promotion dialog for bot moves.
     
     // New progress bar for minimax calculation.
     private JProgressBar progressBar;
@@ -183,22 +193,16 @@ public class ChessBoard extends JFrame {
             updateBoardIcons();
             updateCapturedPiecesDisplay();
         });
-        botMoveButton = new JButton("Bot Move (Black)");
+        botMoveButton = new JButton("Bot Move");
+        botMoveButton.setToolTipText("Click: bot moves for whichever side is to move. Shift+Click: cycle auto mode.");
         botMoveButton.addActionListener(new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
-                if (botThinking) {
-                    return;
+                if ((e.getModifiers() & ActionEvent.SHIFT_MASK) != 0) {
+                    cycleAutoMode();
+                } else {
+                    requestBotMove();
                 }
-                if (whiteTurn) {
-                    JOptionPane.showMessageDialog(null, "It is not Black's turn!");
-                    return;
-                }
-                // Start minimax search in a background thread.
-                botThinking = true;
-                botMoveButton.setEnabled(false);
-                MinimaxWorker worker = new MinimaxWorker(7); // Increase depth as desired.
-                worker.execute();
             }
         });
         
@@ -519,6 +523,7 @@ public class ChessBoard extends JFrame {
                 gameOver = true;
             }
         }
+        maybeScheduleBotMove();
     }
     
     private void highlightSelectedSquare(int row, int col) {
@@ -608,6 +613,13 @@ public class ChessBoard extends JFrame {
     }
     
     private void promotePawn(int row, int col) {
+        if (autoPromote) {
+            // Bot moves always promote to a queen, without interrupting the game.
+            pieces[row][col] = new Queen(pieces[row][col].getColor());
+            String key = (pieces[row][col].getColor().equals(Color.WHITE) ? "white_" : "black_") + pieces[row][col].getPieceType();
+            squares[row][col].setIcon(pieceIcons.get(key));
+            return;
+        }
         String[] options = {"Queen", "Rook", "Bishop", "Knight"};
         String choice = (String) JOptionPane.showInputDialog(
             this,
@@ -688,6 +700,7 @@ public class ChessBoard extends JFrame {
         statusLabel.setText("Game in progress");
         updateTurnLabel();
         resetSquareColors();
+        maybeScheduleBotMove();
     }
     
     private boolean isSquareUnderAttack(int row, int col, Color attacker) {
@@ -811,8 +824,69 @@ public class ChessBoard extends JFrame {
         statusLabel.setText("Game in progress");
         positionCounts.put(Minimax.computePositionKey(pieces, !whiteTurn, enPassantTargetFile), 1);
         resetSquareColors();
+        maybeScheduleBotMove();
     }
     
+    // ---------- Bot Control (manual move + auto-play modes) ----------
+
+    // Starts a one-off bot search for the side that is currently to move.
+    private void requestBotMove() {
+        if (gameOver || botThinking) return;
+        botThinking = true;
+        botMoveButton.setEnabled(false);
+        MinimaxWorker worker = new MinimaxWorker(botDepth);
+        worker.execute();
+    }
+
+    // Starts a bot search automatically when the position requires it in auto mode.
+    private void maybeScheduleBotMove() {
+        if (gameOver || botThinking) return;
+        boolean botPlaysThisTurn = (autoMode == MODE_FULL_AUTO)
+                || (autoMode == MODE_HALF_AUTO && whiteTurn == botPlaysWhite);
+        if (botPlaysThisTurn) requestBotMove();
+    }
+
+    // Cycles the auto-play mode: Manual -> Half Auto -> Full Auto -> Manual.
+    private void cycleAutoMode() {
+        autoMode = (autoMode + 1) % 3;
+        if (autoMode == MODE_HALF_AUTO) {
+            // The bot takes over whichever side is to move right now.
+            botPlaysWhite = whiteTurn;
+        }
+        updateBotButtonLabel();
+        String side = botPlaysWhite ? "White" : "Black";
+        switch (autoMode) {
+            case MODE_MANUAL:
+                statusLabel.setText("Auto mode: Manual (click Bot Move to make it move)");
+                break;
+            case MODE_HALF_AUTO:
+                statusLabel.setText("Auto mode: Bot plays " + side + " automatically");
+                break;
+            default:
+                statusLabel.setText("Auto mode: Bot plays both sides");
+                break;
+        }
+        maybeScheduleBotMove();
+    }
+
+    private void updateBotButtonLabel() {
+        switch (autoMode) {
+            case MODE_MANUAL:
+                botMoveButton.setText("Bot Move");
+                botMoveButton.setToolTipText("Click: bot moves for whichever side is to move. Shift+Click: cycle auto mode.");
+                break;
+            case MODE_HALF_AUTO:
+                botMoveButton.setText("Auto: Bot Plays " + (botPlaysWhite ? "White" : "Black"));
+                botMoveButton.setToolTipText("Bot automatically plays " + (botPlaysWhite ? "White" : "Black")
+                        + ". Shift+Click: cycle auto mode.");
+                break;
+            default:
+                botMoveButton.setText("Auto: Both Sides");
+                botMoveButton.setToolTipText("Bot plays both sides automatically. Shift+Click: cycle auto mode.");
+                break;
+        }
+    }
+
     // ---------- Minimax SwingWorker ----------
     private class MinimaxWorker extends SwingWorker<Move, Void> {
         private int depth;
@@ -856,7 +930,12 @@ public class ChessBoard extends JFrame {
         move.fromCol = bestMove.fromCol;
         move.toRow = bestMove.toRow;
         move.toCol = bestMove.toCol;
-        applyMoveToBoard(move);
+        autoPromote = true;
+        try {
+            applyMoveToBoard(move);
+        } finally {
+            autoPromote = false;
+        }
         resetSquareColors();
     }
 }

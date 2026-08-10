@@ -37,6 +37,32 @@ public class Minimax {
     private static final int[][] historyTable = new int[2][512];
     private static final Move[][] killerMoves = new Move[128][2];
 
+    // Reusable scratch arrays for evaluateBoard (search is single-threaded; avoids per-leaf allocation).
+    private static final int[] EVAL_WHITE_PAWN_COUNTS = new int[8];
+    private static final int[] EVAL_BLACK_PAWN_COUNTS = new int[8];
+    private static final boolean[] EVAL_WHITE_PAWN_FILE = new boolean[8];
+    private static final boolean[] EVAL_BLACK_PAWN_FILE = new boolean[8];
+    private static final int[] EVAL_WHITE_PAWNS = new int[16];
+    private static final int[] EVAL_BLACK_PAWNS = new int[16];
+    private static final int[] EVAL_MAX_WHITE_ROW = new int[8];
+    private static final int[] EVAL_MIN_BLACK_ROW = new int[8];
+    private static final int[] EVAL_PIECE_ROWS = new int[32];
+    private static final int[] EVAL_PIECE_COLS = new int[32];
+    private static final Piece[] EVAL_PIECES = new Piece[32];
+
+    // Precomputed move offsets for targeted move generation.
+    private static final int[][] KNIGHT_OFFSETS = {
+        {-2,-1},{-2,1},{-1,-2},{-1,2},{1,-2},{1,2},{2,-1},{2,1}
+    };
+    private static final int[][] KING_OFFSETS = {
+        {-1,-1},{-1,0},{-1,1},{0,-1},{0,1},{1,-1},{1,0},{1,1}
+    };
+    private static final int[][] BISHOP_RAYS = {{-1,-1},{-1,1},{1,-1},{1,1}};
+    private static final int[][] ROOK_RAYS = {{-1,0},{1,0},{0,-1},{0,1}};
+    private static final int[][] QUEEN_RAYS = {
+        {-1,-1},{-1,0},{-1,1},{0,-1},{0,1},{1,-1},{1,0},{1,1}
+    };
+
     private static final class SearchAborted extends RuntimeException {}
 
     // --- Static Evaluation Constants and Piece-Square Tables ---
@@ -136,60 +162,74 @@ public class Minimax {
 
         int totalMaterial = 0; // Used to determine game phase
 
-        // Pawn structure tracking
-        int[] whitePawnCounts = new int[8]; // Count pawns per file
-        int[] blackPawnCounts = new int[8];
-        boolean[] whitePawnOnFile = new boolean[8];
-        boolean[] blackPawnOnFile = new boolean[8];
+        // Pawn structure tracking (reusable scratch arrays, fully reset each call).
+        Arrays.fill(EVAL_WHITE_PAWN_COUNTS, 0);
+        Arrays.fill(EVAL_BLACK_PAWN_COUNTS, 0);
+        Arrays.fill(EVAL_WHITE_PAWN_FILE, false);
+        Arrays.fill(EVAL_BLACK_PAWN_FILE, false);
+        Arrays.fill(EVAL_MAX_WHITE_ROW, 0);
+        Arrays.fill(EVAL_MIN_BLACK_ROW, 8);
+        int whitePawnCount = 0, blackPawnCount = 0;
+        int pieceCount = 0;
 
-        // Determine castling rights from board state (less efficient than tracking)
-        BoardStateInfo currentState = getBoardStateInfo(board);
+        // Determine castling rights directly from king/rook moved flags (O(1), no state allocation).
+        boolean whiteCanCastle = castleRightsPresent(board, 7, Color.WHITE);
+        boolean blackCanCastle = castleRightsPresent(board, 0, Color.BLACK);
 
+        // Collect piece locations so positional bonuses can use the *final* material total
+        // (phase must not depend on scan order).
         for (int r = 0; r < board.length; r++) {
             for (int c = 0; c < board[r].length; c++) {
                 Piece p = board[r][c];
                 if (p != null) {
-                    int pieceBaseValue = getPieceBaseValue(p);
-                    int pieceEvalValue = getPieceValue(p);
-                    totalMaterial += pieceBaseValue;
-
-                    boolean isEndgame = isEndgame(totalMaterial);
-                    int positionalValue = positionalBonus(p, r, c, isEndgame);
-
+                    totalMaterial += getPieceBaseValue(p);
                     if (p.getColor().equals(Color.WHITE)) {
-                        whiteMaterial += pieceEvalValue;
-                        whitePositional += positionalValue;
+                        whiteMaterial += getPieceValue(p);
                         if (p.getPieceType().equals("pawn")) {
-                            whitePawnCounts[c]++;
-                            whitePawnOnFile[c] = true;
+                            EVAL_WHITE_PAWN_COUNTS[c]++;
+                            EVAL_WHITE_PAWN_FILE[c] = true;
+                            EVAL_WHITE_PAWNS[whitePawnCount++] = (r << 3) | c;
+                            if (r > EVAL_MAX_WHITE_ROW[c]) EVAL_MAX_WHITE_ROW[c] = r;
                         }
                     } else { // Black piece
-                        blackMaterial += pieceEvalValue;
-                        blackPositional += positionalValue;
+                        blackMaterial += getPieceValue(p);
                         if (p.getPieceType().equals("pawn")) {
-                            blackPawnCounts[c]++;
-                            blackPawnOnFile[c] = true;
+                            EVAL_BLACK_PAWN_COUNTS[c]++;
+                            EVAL_BLACK_PAWN_FILE[c] = true;
+                            EVAL_BLACK_PAWNS[blackPawnCount++] = (r << 3) | c;
+                            if (r < EVAL_MIN_BLACK_ROW[c]) EVAL_MIN_BLACK_ROW[c] = r;
                         }
                     }
+                    EVAL_PIECE_ROWS[pieceCount] = r;
+                    EVAL_PIECE_COLS[pieceCount] = c;
+                    EVAL_PIECES[pieceCount++] = p;
                 }
             }
+        }
+
+        // Positional bonuses, using one consistent game phase for the whole position.
+        boolean endgame = isEndgame(totalMaterial);
+        for (int i = 0; i < pieceCount; i++) {
+            int bonus = positionalBonus(EVAL_PIECES[i], EVAL_PIECE_ROWS[i], EVAL_PIECE_COLS[i], endgame);
+            if (EVAL_PIECES[i].getColor().equals(Color.WHITE)) whitePositional += bonus;
+            else blackPositional += bonus;
         }
 
         // Calculate Pawn Structure Penalties/Bonuses
         for (int c = 0; c < 8; c++) {
             // Doubled Pawns
-            if (whitePawnCounts[c] > 1) whitePawnStructure += (whitePawnCounts[c] - 1) * DOUBLED_PAWN_PENALTY;
-            if (blackPawnCounts[c] > 1) blackPawnStructure += (blackPawnCounts[c] - 1) * DOUBLED_PAWN_PENALTY;
+            if (EVAL_WHITE_PAWN_COUNTS[c] > 1) whitePawnStructure += (EVAL_WHITE_PAWN_COUNTS[c] - 1) * DOUBLED_PAWN_PENALTY;
+            if (EVAL_BLACK_PAWN_COUNTS[c] > 1) blackPawnStructure += (EVAL_BLACK_PAWN_COUNTS[c] - 1) * DOUBLED_PAWN_PENALTY;
 
             // Isolated Pawns (no friendly pawn on adjacent files)
-            boolean whiteIsolated = whitePawnOnFile[c] && (c == 0 || !whitePawnOnFile[c - 1]) && (c == 7 || !whitePawnOnFile[c + 1]);
-            boolean blackIsolated = blackPawnOnFile[c] && (c == 0 || !blackPawnOnFile[c - 1]) && (c == 7 || !blackPawnOnFile[c + 1]);
+            boolean whiteIsolated = EVAL_WHITE_PAWN_FILE[c] && (c == 0 || !EVAL_WHITE_PAWN_FILE[c - 1]) && (c == 7 || !EVAL_WHITE_PAWN_FILE[c + 1]);
+            boolean blackIsolated = EVAL_BLACK_PAWN_FILE[c] && (c == 0 || !EVAL_BLACK_PAWN_FILE[c - 1]) && (c == 7 || !EVAL_BLACK_PAWN_FILE[c + 1]);
             if (whiteIsolated) whitePawnStructure += ISOLATED_PAWN_PENALTY;
             if (blackIsolated) blackPawnStructure += ISOLATED_PAWN_PENALTY;
         }
-        // Passed Pawns (needs check for opposing pawns in front on same/adjacent files)
-        whitePawnStructure += calculatePassedPawnBonus(board, Color.WHITE, blackPawnOnFile);
-        blackPawnStructure += calculatePassedPawnBonus(board, Color.BLACK, whitePawnOnFile);
+        // Passed Pawns (no full-board scan: walks only the tracked pawn squares)
+        whitePawnStructure += calculatePassedPawnBonus(EVAL_WHITE_PAWNS, whitePawnCount, Color.WHITE, EVAL_MIN_BLACK_ROW);
+        blackPawnStructure += calculatePassedPawnBonus(EVAL_BLACK_PAWNS, blackPawnCount, Color.BLACK, EVAL_MAX_WHITE_ROW);
 
 
         // Calculate Mobility (Expensive - consider simplifying or caching)
@@ -202,8 +242,8 @@ public class Minimax {
 
 
         // Add castling bonus if rights are intact
-        if (currentState.whiteKingsideCastle || currentState.whiteQueensideCastle) whiteCastleBonus = CASTLING_BONUS;
-        if (currentState.blackKingsideCastle || currentState.blackQueensideCastle) blackCastleBonus = CASTLING_BONUS;
+        if (whiteCanCastle) whiteCastleBonus = CASTLING_BONUS;
+        if (blackCanCastle) blackCastleBonus = CASTLING_BONUS;
 
 
         // Combine scores
@@ -215,40 +255,51 @@ public class Minimax {
         return blackTurn ? evaluation : -evaluation; // Return score for current player
     }
 
-    /** Calculates bonus for passed pawns for a given color. */
-    private static int calculatePassedPawnBonus(Piece[][] board, Color color, boolean[] opponentPawnsOnFile) {
+    /**
+     * Calculates bonus for passed pawns for a given color, walking only the tracked pawn squares.
+     * @param pawnSquares (row << 3) | col for each pawn of the given color
+     * @param count number of pawns in pawnSquares
+     * @param frontOpponentPawn per-file frontmost opponent pawn row: min row for black pawns (white passed check),
+     *                          max row for white pawns (black passed check); sentinels 8/0 mean "none on file"
+     */
+    private static int calculatePassedPawnBonus(int[] pawnSquares, int count, Color color, int[] frontOpponentPawn) {
         int bonus = 0;
         int direction = color.equals(Color.WHITE) ? -1 : 1;
         int startRank = color.equals(Color.WHITE) ? 6 : 1;
-        int promotionRank = color.equals(Color.WHITE) ? 0 : 7;
 
-        for (int r = 0; r < 8; r++) {
-            for (int c = 0; c < 8; c++) {
-                Piece p = board[r][c];
-                if (p != null && p.getPieceType().equals("pawn") && p.getColor().equals(color)) {
-                    boolean isPassed = true;
-                    // Check files in front (same file, adjacent files) for opponent pawns
-                    for (int checkCol = Math.max(0, c - 1); checkCol <= Math.min(7, c + 1); checkCol++) {
-                        for (int checkRow = r + direction; ; checkRow += direction) {
-                             if (checkRow < 0 || checkRow > 7) break; // Off board
-                             Piece ahead = board[checkRow][checkCol];
-                             if (ahead != null && ahead.getPieceType().equals("pawn") && ahead.getColor() != color) {
-                                 isPassed = false; // Opponent pawn blocks path
-                                 break;
-                             }
-                        }
-                        if (!isPassed) break; // No need to check other files if blocked
-                    }
-
-                    if (isPassed) {
-                        // Scale bonus by how far advanced the pawn is
-                        int rankDistance = Math.abs(r - startRank);
-                        bonus += PASSED_PAWN_BONUS * (rankDistance + 1); // Simple scaling
-                    }
+        for (int i = 0; i < count; i++) {
+            int r = pawnSquares[i] >> 3;
+            int c = pawnSquares[i] & 7;
+            boolean isPassed = true;
+            // Blocked if any opponent pawn sits ahead on the same or adjacent file.
+            int colMin = Math.max(0, c - 1), colMax = Math.min(7, c + 1);
+            if (direction < 0) {
+                // White: an opponent (black) pawn ahead has row < r.
+                for (int fc = colMin; fc <= colMax; fc++) {
+                    if (frontOpponentPawn[fc] < r) { isPassed = false; break; }
                 }
+            } else {
+                // Black: an opponent (white) pawn ahead has row > r.
+                for (int fc = colMin; fc <= colMax; fc++) {
+                    if (frontOpponentPawn[fc] > r) { isPassed = false; break; }
+                }
+            }
+            if (isPassed) {
+                int rankDistance = Math.abs(r - startRank);
+                bonus += PASSED_PAWN_BONUS * (rankDistance + 1); // Simple scaling
             }
         }
         return bonus;
+    }
+
+    /** True if the king on homeRank and either rook are unmoved, i.e. the color can still castle somewhere. */
+    private static boolean castleRightsPresent(Piece[][] board, int homeRank, Color color) {
+        Piece king = board[homeRank][4];
+        if (!(king instanceof King) || !king.getColor().equals(color) || king.hasMoved()) return false;
+        Piece r1 = board[homeRank][0];
+        Piece r2 = board[homeRank][7];
+        return (r1 instanceof Rook && r1.getColor().equals(color) && !r1.hasMoved())
+            || (r2 instanceof Rook && r2.getColor().equals(color) && !r2.hasMoved());
     }
 
     /** Calculates a simple mobility score (sum of potential moves, not fully legal). */
@@ -402,6 +453,9 @@ public class Minimax {
         int bestValue = Integer.MIN_VALUE; // Score relative to current player
         Move bestMove = null;
 
+        // In-check flag computed once, used to guard shallow pruning (LMP).
+        boolean inCheck = isKingInCheck(board, isBlackTurn ? Color.BLACK : Color.WHITE);
+
         // --- Principal Variation Search Logic ---
         // 1. Search the first move (potentially the best move from TT or move ordering) with a full window.
         Move firstMove = moves.get(0);
@@ -419,11 +473,21 @@ public class Minimax {
             if (alpha >= beta) break; // Alpha-beta cutoff
 
             Move move = moves.get(i);
+
+            // Late Move Pruning: drop late quiet moves at shallow depth (skip in check).
+            if (!inCheck && !move.wasCastling && !move.wasPromotion && move.capturedPiece == null && i >= 4 + 2 * depth) {
+                continue;
+            }
+
             BoardStateInfo nextState = applyMove(board, move, boardState);
 
             try {
-                // Late Move Reduction: reduce quiet late moves, re-search if they beat alpha
-                int reduction = (i >= 4 && depth >= 3 && move.capturedPiece == null && !move.wasPromotion && !move.wasCastling) ? 1 : 0;
+                // Late Move Reduction: reduce late quiet moves, re-search if they beat alpha.
+                int reduction = 0;
+                if (move.capturedPiece == null && !move.wasPromotion && !move.wasCastling) {
+                    if (i >= 4 && depth >= 3) reduction = 1;
+                    if (i >= 10 && depth >= 5) reduction = 2;
+                }
 
                 int score;
                 if (reduction > 0) {
@@ -523,10 +587,8 @@ public class Minimax {
         alpha = Math.max(alpha, standPat);
 
         // --- Generate and Explore "Interesting" Moves (Captures and Promotions primarily) ---
-        // Checks can sometimes be included but can lead to infinite loops if not careful
-        List<Move> interestingMoves = generateMoves(board, isBlackTurn, true, boardState, ply);
-        // Keep only captures and promotions for standard quiescence
-        interestingMoves.removeIf(move -> !move.wasPromotion && board[move.toRow][move.toCol] == null && !isEnPassantCapture(board, move));
+        // Captures-only generation avoids generating and filtering the full quiet move set.
+        List<Move> interestingMoves = generateMoves(board, isBlackTurn, true, boardState, ply, true);
 
         int bestValue = standPat; // Initialize with stand-pat score
 
@@ -602,17 +664,29 @@ public class Minimax {
         String player = blackTurn ? "Black" : "White";
         System.out.printf("Starting Minimax Search (%s)... Max Depth: %d\n", player, maxSearchDepth);
 
-        // Iterative Deepening Loop
+        // Iterative Deepening Loop (with aspiration windows: each iteration searches a narrow
+        // window around the previous depth's evaluation, re-searching with a full window on fail).
+        Integer prevEval = null;
         for (int depth = 1; depth <= maxSearchDepth; depth++) {
             long startTime = System.currentTimeMillis();
 
             int currentEval;
             try {
-                currentEval = negamax(board, depth, Integer.MIN_VALUE + 1, Integer.MAX_VALUE - 1, color, initialState, depth);
+                if (prevEval == null) {
+                    currentEval = negamax(board, depth, Integer.MIN_VALUE + 1, Integer.MAX_VALUE - 1, color, initialState, depth);
+                } else {
+                    int window = depth <= 2 ? 200 : 50;
+                    currentEval = negamax(board, depth, prevEval - window, prevEval + window, color, initialState, depth);
+                    if (currentEval <= prevEval - window || currentEval >= prevEval + window) {
+                        // Aspiration failed: re-search with a full window.
+                        currentEval = negamax(board, depth, Integer.MIN_VALUE + 1, Integer.MAX_VALUE - 1, color, initialState, depth);
+                    }
+                }
             } catch (SearchAborted e) {
                 System.out.printf("Depth %d: search aborted (time limit exceeded)\n", depth);
                 break;
             }
+            prevEval = currentEval;
 
             // Retrieve the best move for this depth from the TT (stored by negamax)
             TranspositionEntry rootEntry = ttProbe(initialState.zobristHash);
@@ -819,21 +893,12 @@ public class Minimax {
         if (movedPiece instanceof King) {
              ((King) movedPiece).setPosition(move.toRow, move.toCol);
         }
-        // Reset double move flag for all pawns *except* the one that might have just moved
+        // O(1) double-move flag update: only the moved piece can carry the flag,
+        // and undoMove restores it afterwards. The EP generator also re-validates geometry.
         boolean justMadeDouble = movedPiece instanceof Pawn && Math.abs(move.toRow - move.fromRow) == 2;
-        for(int r=0; r<8; r++){
-             for(int c=0; c<8; c++){
-                 Piece p = board[r][c];
-                 if(p instanceof Pawn){
-                     if(p == movedPiece){
-                         ((Pawn)p).setJustMadeDoubleMove(justMadeDouble);
-                     } else if (p.getColor() == movedPiece.getColor()) {
-                         // Reset flag for other friendly pawns only
-                         ((Pawn)p).setJustMadeDoubleMove(false);
-                     }
-                 }
-             }
-         }
+        if (movedPiece instanceof Pawn) {
+            ((Pawn) movedPiece).setJustMadeDoubleMove(justMadeDouble);
+        }
 
 
         // 6. --- Toggle Side to Move Hash ---
@@ -878,6 +943,11 @@ public class Minimax {
     }
 
     public static List<Move> generateMoves(Piece[][] board, boolean blackTurn, boolean ordered, BoardStateInfo state, int ply) {
+        return generateMoves(board, blackTurn, ordered, state, ply, false);
+    }
+
+    /** Full move generation. When capturesOnly is true, only captures and promotions are generated. */
+    public static List<Move> generateMoves(Piece[][] board, boolean blackTurn, boolean ordered, BoardStateInfo state, int ply, boolean capturesOnly) {
         List<Move> pseudoMoves = new ArrayList<>();
         Color playerColor = blackTurn ? Color.BLACK : Color.WHITE;
 
@@ -885,8 +955,8 @@ public class Minimax {
             for (int c = 0; c < board[r].length; c++) {
                 Piece p = board[r][c];
                 if (p != null && p.getColor().equals(playerColor)) {
-                    generatePieceMoves(board, r, c, p, pseudoMoves);
-                    if (p instanceof King && !p.hasMoved()) {
+                    generatePieceMoves(board, r, c, p, pseudoMoves, capturesOnly);
+                    if (!capturesOnly && p instanceof King && !p.hasMoved()) {
                         addCastlingMoves(board, r, c, (King)p, pseudoMoves, state);
                     }
                     if (p instanceof Pawn) {
@@ -900,20 +970,97 @@ public class Minimax {
         return legalMoves;
     }
 
-    /** Generates standard moves for a single piece. */
-    private static void generatePieceMoves(Piece[][] board, int r, int c, Piece p, List<Move> moves) {
-        for (int tr = 0; tr < board.length; tr++) {
-            for (int tc = 0; tc < board[r].length; tc++) {
-                if (p.isValidMove(r, c, tr, tc, board)) {
-                    Move move = new Move(r, c, tr, tc, p);
-                    move.capturedPiece = board[tr][tc];
-                    if (p.getPieceType().equals("pawn") && (tr == 0 || tr == 7)) {
-                        move.wasPromotion = true;
-                    }
-                    moves.add(move);
+    /** Generates moves for a single piece using targeted generation instead of a 64-square probe. */
+    private static void generatePieceMoves(Piece[][] board, int r, int c, Piece p, List<Move> moves, boolean capturesOnly) {
+        String type = p.getPieceType();
+        switch (type) {
+            case "pawn":   generatePawnMoves(board, r, c, p, moves, capturesOnly); break;
+            case "knight": generateKnightMoves(board, r, c, p, moves, capturesOnly); break;
+            case "bishop": generateSliderMoves(board, r, c, p, moves, BISHOP_RAYS, capturesOnly); break;
+            case "rook":   generateSliderMoves(board, r, c, p, moves, ROOK_RAYS, capturesOnly); break;
+            case "queen":  generateSliderMoves(board, r, c, p, moves, QUEEN_RAYS, capturesOnly); break;
+            case "king":   generateKingMoves(board, r, c, p, moves, capturesOnly); break;
+        }
+    }
+
+    private static void generatePawnMoves(Piece[][] board, int r, int c, Piece p, List<Move> moves, boolean capturesOnly) {
+        int dir = p.getColor().equals(Color.WHITE) ? -1 : 1;
+        int fRow = r + dir;
+        if (fRow < 0 || fRow > 7) return;
+        boolean canPromote = fRow == 0 || fRow == 7;
+
+        // Forward one square (always included for promotions, even in capturesOnly mode).
+        if (board[fRow][c] == null) {
+            if (!capturesOnly || canPromote) {
+                addMove(board, r, c, fRow, c, p, moves, canPromote);
+                // Initial double push.
+                boolean startRow = (p.getColor().equals(Color.WHITE) && r == 6) || (p.getColor().equals(Color.BLACK) && r == 1);
+                if (!capturesOnly && startRow && board[r + 2 * dir][c] == null) {
+                    addMove(board, r, c, r + 2 * dir, c, p, moves, false);
                 }
             }
         }
+        // Diagonal captures.
+        for (int dc = -1; dc <= 1; dc += 2) {
+            int tc = c + dc;
+            if (tc < 0 || tc > 7) continue;
+            Piece target = board[fRow][tc];
+            if (target != null && !target.getColor().equals(p.getColor())) {
+                addMove(board, r, c, fRow, tc, p, moves, canPromote);
+            }
+        }
+    }
+
+    private static void generateKnightMoves(Piece[][] board, int r, int c, Piece p, List<Move> moves, boolean capturesOnly) {
+        for (int[] off : KNIGHT_OFFSETS) {
+            int tr = r + off[0], tc = c + off[1];
+            if (tr < 0 || tr > 7 || tc < 0 || tc > 7) continue;
+            Piece target = board[tr][tc];
+            if (target == null) {
+                if (!capturesOnly) addMove(board, r, c, tr, tc, p, moves, false);
+            } else if (!target.getColor().equals(p.getColor())) {
+                addMove(board, r, c, tr, tc, p, moves, false);
+            }
+        }
+    }
+
+    private static void generateKingMoves(Piece[][] board, int r, int c, Piece p, List<Move> moves, boolean capturesOnly) {
+        for (int[] off : KING_OFFSETS) {
+            int tr = r + off[0], tc = c + off[1];
+            if (tr < 0 || tr > 7 || tc < 0 || tc > 7) continue;
+            Piece target = board[tr][tc];
+            if (target == null) {
+                if (!capturesOnly) addMove(board, r, c, tr, tc, p, moves, false);
+            } else if (!target.getColor().equals(p.getColor())) {
+                addMove(board, r, c, tr, tc, p, moves, false);
+            }
+        }
+    }
+
+    private static void generateSliderMoves(Piece[][] board, int r, int c, Piece p, List<Move> moves, int[][] rays, boolean capturesOnly) {
+        for (int[] d : rays) {
+            int tr = r + d[0], tc = c + d[1];
+            while (tr >= 0 && tr <= 7 && tc >= 0 && tc <= 7) {
+                Piece target = board[tr][tc];
+                if (target == null) {
+                    if (!capturesOnly) addMove(board, r, c, tr, tc, p, moves, false);
+                } else {
+                    if (!target.getColor().equals(p.getColor())) {
+                        addMove(board, r, c, tr, tc, p, moves, false);
+                    }
+                    break;
+                }
+                tr += d[0];
+                tc += d[1];
+            }
+        }
+    }
+
+    private static void addMove(Piece[][] board, int r, int c, int tr, int tc, Piece p, List<Move> moves, boolean promote) {
+        Move move = new Move(r, c, tr, tc, p);
+        move.capturedPiece = board[tr][tc];
+        if (promote) move.wasPromotion = true;
+        moves.add(move);
     }
 
     /** Adds potential castling moves. */
@@ -981,11 +1128,14 @@ public class Minimax {
     private static List<Move> filterLegalMoves(Piece[][] board, List<Move> pseudoMoves, boolean blackTurn, BoardStateInfo state) {
         List<Move> legalMoves = new ArrayList<>();
         Color kingColor = blackTurn ? Color.BLACK : Color.WHITE;
+        Color attackerColor = kingColor.equals(Color.WHITE) ? Color.BLACK : Color.WHITE;
+        // The King object tracks its own position through make/unmake, so resolve it once.
+        int[] kingPos = findKing(board, kingColor);
+        King king = (kingPos == null) ? null : (King) board[kingPos[0]][kingPos[1]];
 
         for (Move move : pseudoMoves) {
             applyMove(board, move, state);
-            int[] kingPos = findKing(board, kingColor);
-            if (kingPos != null && !isKingInCheck(board, kingColor)) {
+            if (king != null && !isSquareUnderAttack(board, king.getRow(), king.getCol(), attackerColor)) {
                 legalMoves.add(move);
             }
             undoMove(board, move);
@@ -1000,17 +1150,55 @@ public class Minimax {
         return isSquareUnderAttack(board, kingPos[0], kingPos[1], kingColor.equals(Color.WHITE) ? Color.BLACK : Color.WHITE);
     }
 
-    /** Checks if a given square is attacked by any piece of the attackerColor. */
+    /** Checks if a square is attacked by any enemy piece, by probing from the target square. */
     private static boolean isSquareUnderAttack(Piece[][] board, int targetRow, int targetCol, Color attackerColor) {
-        for (int r = 0; r < board.length; r++) {
-            for (int c = 0; c < board[r].length; c++) {
+        // Adjacent enemy king.
+        for (int[] off : KING_OFFSETS) {
+            int r = targetRow + off[0], c = targetCol + off[1];
+            if (r >= 0 && r <= 7 && c >= 0 && c <= 7) {
                 Piece p = board[r][c];
-                if (p != null && p.getColor().equals(attackerColor)) {
-                    // Assumes Piece class has isValidAttack method (Pawn overrides it)
-                    if (p.isValidAttack(r, c, targetRow, targetCol, board)) {
+                if (p != null && p.getColor().equals(attackerColor) && p.getPieceType().equals("king"))
+                    return true;
+            }
+        }
+        // Enemy knights.
+        for (int[] off : KNIGHT_OFFSETS) {
+            int r = targetRow + off[0], c = targetCol + off[1];
+            if (r >= 0 && r <= 7 && c >= 0 && c <= 7) {
+                Piece p = board[r][c];
+                if (p != null && p.getColor().equals(attackerColor) && p.getPieceType().equals("knight"))
+                    return true;
+            }
+        }
+        // Enemy pawns (attack diagonally from the rank just behind the target).
+        int pawnDir = attackerColor.equals(Color.WHITE) ? 1 : -1;
+        int pr = targetRow + pawnDir;
+        if (pr >= 0 && pr <= 7) {
+            for (int dc = -1; dc <= 1; dc += 2) {
+                int c = targetCol + dc;
+                if (c >= 0 && c <= 7) {
+                    Piece p = board[pr][c];
+                    if (p != null && p.getColor().equals(attackerColor) && p.getPieceType().equals("pawn"))
                         return true;
-                    }
                 }
+            }
+        }
+        // Sliding pieces along rays.
+        for (int[] d : QUEEN_RAYS) {
+            int r = targetRow + d[0], c = targetCol + d[1];
+            boolean diag = (d[0] != 0 && d[1] != 0);
+            while (r >= 0 && r <= 7 && c >= 0 && c <= 7) {
+                Piece p = board[r][c];
+                if (p != null) {
+                    if (p.getColor().equals(attackerColor)) {
+                        String t = p.getPieceType();
+                        if (t.equals("queen") || (diag ? t.equals("bishop") : t.equals("rook")))
+                            return true;
+                    }
+                    break;
+                }
+                r += d[0];
+                c += d[1];
             }
         }
         return false;
